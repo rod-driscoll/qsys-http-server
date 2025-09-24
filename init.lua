@@ -1319,10 +1319,14 @@ HttpServer = (function()
         local expectedBodyLength = tonumber(headers['content-length'][1]);
         if(not expectedBodyLength) then return respond(Sock, 400); end;
 
-        body = body .. Sock:Read(expectedBodyLength);
         while(#body < expectedBodyLength) do
-          coroutine.yield();
-          body = body .. Sock:Read(expectedBodyLength);
+          local remainingBytes = expectedBodyLength - #body;
+          local chunk = Sock:Read(remainingBytes);
+          if(chunk and #chunk > 0) then
+            body = body .. chunk;
+          else
+            coroutine.yield();
+          end;
         end;
 
       end;
