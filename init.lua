@@ -1115,7 +1115,10 @@ HttpServer = (function()
       options.keepalive = true;
     end;
 
-    if(body ~= nil) then
+    -- Use chunked encoding if explicitly requested
+    if(options.chunked) then
+      headerString = headerString .. 'Transfer-Encoding: chunked\r\n';
+    elseif(body ~= nil) then
       headerString = headerString .. ('Content-Length: %d\r\n'):format(#body);
     end;
 
@@ -1131,6 +1134,17 @@ HttpServer = (function()
     if(not options.keepalive) then Timer.CallAfter(function() sock:Disconnect(); end, 1); end; -- workaround for non-blocking write
   end;
 
+  local function sendChunk(sock, data)
+    if(data and #data > 0) then
+      sock:Write(string.format('%X\r\n', #data) .. data .. '\r\n');
+    end;
+  end;
+
+  local function endChunked(sock)
+    sock:Write('0\r\n\r\n');
+    Timer.CallAfter(function() sock:Disconnect(); end, 1);
+  end;
+
   local function defaultHandler(req, res)
     res.sendStatus(404);
   end;
@@ -1140,7 +1154,9 @@ HttpServer = (function()
       return setmetatable({
         socket = obj.socket,
         headers = {},
-        statusCode = obj.statusCode or 200
+        statusCode = obj.statusCode or 200,
+        _headersSent = false,
+        _chunked = false
       },{
         __index = function(t,k)
           if(k == 'status') then
@@ -1151,6 +1167,7 @@ HttpServer = (function()
           elseif(k == 'send') then
             return function(body)
               respond(t.socket, t.statusCode, body, {headers = t.headers});
+              t._headersSent = true;
               return t;
             end
           elseif(k == 'set') then
@@ -1166,6 +1183,37 @@ HttpServer = (function()
             return function(code)
               t.status(code);
               t.send(HTTP_CODES[code]);
+              return t;
+            end;
+          elseif(k == 'writeHead') then
+            return function(code)
+              if(t._headersSent) then
+                error('Headers already sent');
+              end;
+              code = code or t.statusCode;
+              respond(t.socket, code, nil, {headers = t.headers, chunked = t._chunked});
+              t._headersSent = true;
+              return t;
+            end;
+          elseif(k == 'write') then
+            return function(data)
+              if(not t._headersSent) then
+                t._chunked = true;
+                t.writeHead();
+              end;
+              sendChunk(t.socket, data);
+              return t;
+            end;
+          elseif(k == 'end') then
+            return function(data)
+              if(data) then
+                t.write(data);
+              end;
+              if(t._chunked) then
+                endChunked(t.socket);
+              elseif(not t._headersSent) then
+                t.send('');
+              end;
               return t;
             end;
           end
@@ -1549,18 +1597,38 @@ HttpServer = (function()
 
       end;
     end,
-    Static = function(root)
+    Static = function(root, options)
       if(root:match('^/')) then root = root:sub(2); end;
+      options = options or {};
+      local chunkSize = options.chunkSize or 8192; -- 8KB default chunk size
+      local useChunkedTransfer = options.chunked == true; -- disabled by default for reliability
+
       return function(req, res)
         local fh = io.open(root .. req.path, 'r');
         if(not fh) then return; end;
-        local data = fh:read('*all');
-        fh:close();
+
+        -- Set MIME type based on file extension
         if not res.get('Content-Type') then
           local extension = req.path:match("^.+%.(.+)$")
           if MIME_HEADERS[extension] then res.set('Content-Type', MIME_HEADERS[extension]); end
         end;
-        res.send(data);
+
+        -- For chunked transfer, stream the file
+        if(useChunkedTransfer) then
+          local chunk = fh:read(chunkSize);
+          while(chunk) do
+            res.write(chunk);
+            chunk = fh:read(chunkSize);
+          end;
+          fh:close();
+          res['end']();
+        else
+          -- For non-chunked transfer, read entire file
+          local data = fh:read('*all');
+          fh:close();
+          res.send(data);
+        end;
+
         return true; -- handled
       end;
     end
